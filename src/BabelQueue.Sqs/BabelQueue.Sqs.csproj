@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- Static analysis: Roslyn analyzers at the recommended ruleset, failing the
+         build on any finding. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- NuGet package metadata -->
+    <PackageId>BabelQueue.Sqs</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Muhammet Şafak</Authors>
+    <Company>BabelQueue</Company>
+    <Description>Amazon SQS transport for BabelQueue — a canonical-envelope publisher and a URN-routed consumer over the AWS SDK for .NET, on the framework-agnostic core.</Description>
+    <PackageProjectUrl>https://babelqueue.com</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/BabelQueue/babelqueue-dotnet-sqs</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>babelqueue;sqs;aws;queue;polyglot;messaging</PackageTags>
+    <Copyright>Copyright (c) 2026 Muhammet Şafak</Copyright>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.SQS" Version="4.0.3.3" />
+    <PackageReference Include="BabelQueue.Core" Version="1.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Let the test project assert the internal attribute projection against the conformance golden. -->
+    <InternalsVisibleTo Include="BabelQueue.Sqs.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
