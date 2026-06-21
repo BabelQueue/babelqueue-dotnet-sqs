@@ -67,6 +67,32 @@ redelivers it after the visibility timeout (at-least-once). The poll loop never 
 a bad message — observe via `OnError` / `OnUnknownUrn`. The envelope is unchanged
 (`schema_version` stays `1`); SQS is purely additive.
 
+## OpenTelemetry `traceparent` propagation (ADR-0028)
+
+For true cross-hop **span** parent-child linkage, the active producer span's W3C `traceparent`
+rides as a String `MessageAttribute` **beside** the frozen envelope (never inside it). Produce with
+the header-aware overload; the carrier is filled by `BabelQueue.Core`'s `Telemetry.PublishAsync`:
+
+```csharp
+using BabelQueue.Tracing;
+
+var headers = new Dictionary<string, string>();
+await Telemetry.PublishAsync("urn:babel:orders:created", data, headers,
+    env => new SqsPublisher(sqs, url).PublishWithHeadersAsync("urn:babel:orders:created", data, headers));
+```
+
+On the consume side, surface the inbound attributes and start the consumer span as a child:
+
+```csharp
+["urn:babel:orders:created"] = Telemetry.Wrap(
+    async env => { /* ... */ },
+    SqsHeaders.Extract(message.MessageAttributes)) // call inside the handler with the raw Message
+```
+
+`SqsHeaders.Merge` never clobbers the contract `bq-*` attributes and respects the SQS 10-attribute
+cap; with no `traceparent` the consumer falls back to the v0.1 `trace_id` mapping. A header-less
+publish is byte-identical to `PublishAsync`. Requires `BabelQueue.Core 1.4.0`.
+
 ## Build & test
 
 ```bash
