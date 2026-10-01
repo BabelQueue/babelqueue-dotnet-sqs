@@ -95,7 +95,7 @@ public sealed class SqsPublisher
         return envelope.Meta?.Id ?? string.Empty;
     }
 
-    private static string QueueName(string queueUrl)
+    internal static string QueueName(string queueUrl)
     {
         var segments = queueUrl.Split('/', StringSplitOptions.RemoveEmptyEntries);
         return segments.Length == 0 ? "default" : segments[^1];

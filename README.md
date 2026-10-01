@@ -61,11 +61,52 @@ LocalStack/ElasticMQ, point the `AmazonSQSClient`'s `ServiceURL` there.
 | `meta.created_at` | `MessageAttributes.bq-created-at` (Number, ms) |
 | `attempts` | reconciled to `ApproximateReceiveCount − 1` on receive |
 | reserve / ack | visibility timeout → `DeleteMessage` |
+| release / nack | `ChangeMessageVisibility(VisibilityTimeout = backoff)` |
 
-Retry is **SQS-native**: a throwing handler leaves the message undeleted, so SQS
-redelivers it after the visibility timeout (at-least-once). The poll loop never stops on
-a bad message — observe via `OnError` / `OnUnknownUrn`. The envelope is unchanged
-(`schema_version` stays `1`); SQS is purely additive.
+## Retry, unknown URNs and dead-lettering
+
+A throwing handler **releases** the message with
+`ChangeMessageVisibility(VisibilityTimeout = RetryBackoffSeconds)` — it is never deleted, so
+SQS redelivers it (at-least-once) and `ApproximateReceiveCount` stays the attempt counter.
+`RetryBackoffSeconds` defaults to **`0` (redeliver immediately)**; it is clamped to 0–43200.
+
+> **Poison-loop risk.** With the default `0`, a message whose handler always fails is
+> redelivered immediately, forever. Always give the source queue a native **redrive policy**
+> so SQS moves it aside after N receives, and set a backoff if you want a pause between attempts:
+>
+> ```json
+> { "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:…:orders.dlq\",\"maxReceiveCount\":\"5\"}" }
+> ```
+
+A message whose URN has no handler follows `UnknownUrnStrategy` (an `OnUnknownUrn` hook,
+when set, takes precedence and the message is then deleted):
+
+| Strategy | Effect |
+| :--- | :--- |
+| `fail` (default) | `OnError(UnknownUrnException)`; the message is left to SQS |
+| `delete` | `DeleteMessage` |
+| `release` | `ChangeMessageVisibility(UnknownUrnReleaseDelaySeconds)` — default `0`, same poison-loop caveat |
+| `dead_letter` | send to `DeadLetterQueueUrl` with a `dead_letter` block (reason `unknown_urn`), then delete; no DLQ URL → delete |
+
+A FIFO DLQ (`<queue>.dlq.fifo`) is sent with `MessageGroupId = meta.queue` and
+`MessageDeduplicationId = meta.id`. Any other strategy string is rejected by the constructor.
+
+```csharp
+var consumer = new SqsConsumer(sqs, url, handlers, new SqsConsumerOptions
+{
+    RetryBackoffSeconds = 30,
+    UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+    DeadLetterQueueUrl = dlqUrl,
+    OnError = (err, env, msg) => Console.Error.WriteLine(err),
+});
+```
+
+The poll loop never stops on a bad message: a failing release, dead-letter send or delete on
+the failure path is reported via `OnError` and the message is left to visibility expiry.
+If the handler succeeds but the delete then fails, `OnError` receives a `BabelQueueException`
+wrapping the broker error; the message is **not** released, so it reappears once its
+visibility timeout expires and may be handled again (keep handlers idempotent).
+The envelope is unchanged (`schema_version` stays `1`); SQS is purely additive.
 
 ## OpenTelemetry `traceparent` propagation (ADR-0028)
 

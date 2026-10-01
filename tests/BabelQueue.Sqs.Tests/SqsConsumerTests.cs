@@ -81,7 +81,7 @@ public sealed class SqsConsumerTests
     }
 
     [Fact]
-    public async Task ThrowingHandlerLeavesMessageAndReportsOnError()
+    public async Task ThrowingHandlerReleasesViaChangeVisibilityAndReportsOnError()
     {
         var mock = MockReceiving(Seed(Envelope(), 1));
         Exception? captured = null;
@@ -95,6 +95,143 @@ public sealed class SqsConsumerTests
 
         Assert.IsType<InvalidOperationException>(captured);
         mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.QueueUrl == Url && r.ReceiptHandle == "rh-1" && r.VisibilityTimeout == 0),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData(30, 30)]
+    [InlineData(-5, 0)]
+    [InlineData(99999, 43200)]
+    public async Task ReleaseBackoffIsClampedToSqsVisibilityRange(int backoff, int expected)
+    {
+        var mock = MockReceiving(Seed(Envelope(), 2));
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+        var options = new SqsConsumerOptions { RetryBackoffSeconds = backoff };
+
+        await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.VisibilityTimeout == expected),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ReleaseWithoutReceiptHandleIsSkipped()
+    {
+        var message = Seed(Envelope(), 1);
+        message.ReceiptHandle = null;
+        var mock = MockReceiving(message);
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new SqsConsumer(mock.Object, Url, handlers).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownUrnReleaseStrategyChangesVisibility()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.Release,
+            UnknownUrnReleaseDelaySeconds = 12,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.ReceiptHandle == "rh-1" && r.VisibilityTimeout == 12),
+            It.IsAny<CancellationToken>()), Times.Once);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownUrnReleaseDefaultsToZeroSeconds()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.Release };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.VisibilityTimeout == 0),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task UnknownUrnDeleteStrategyDeletes()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.Delete };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        mock.Verify(c => c.DeleteMessageAsync(It.Is<DeleteMessageRequest>(r => r.ReceiptHandle == "rh-1"), It.IsAny<CancellationToken>()), Times.Once);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownUrnDeadLetterStrategySendsToDlqThenDeletes()
+    {
+        const string dlq = Url + ".dlq";
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        SendMessageRequest? sent = null;
+        mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<SendMessageRequest, CancellationToken>((r, _) => sent = r)
+            .ReturnsAsync(new SendMessageResponse());
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = dlq,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.NotNull(sent);
+        Assert.Equal(dlq, sent!.QueueUrl);
+        var dead = EnvelopeCodec.Decode(sent.MessageBody);
+        Assert.Equal("unknown_urn", dead.DeadLetter!.Reason);
+        Assert.Equal("orders", dead.DeadLetter.OriginalQueue);
+        Assert.Equal("urn:babel:orders:created", sent.MessageAttributes["bq-job"].StringValue);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task UnknownUrnDeadLetterWithoutDlqDegradesToDelete()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        mock.Verify(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task DeadLetteredMessageCarriesUnknownKeys()
+    {
+        const string dlq = Url + ".dlq";
+        var body = Envelope().Replace("\"attempts\":0", "\"attempts\":0,\"extra_top\":{\"k\":[1,2]}", StringComparison.Ordinal);
+        var mock = MockReceiving(Seed(body, 1));
+        SendMessageRequest? sent = null;
+        mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<SendMessageRequest, CancellationToken>((r, _) => sent = r)
+            .ReturnsAsync(new SendMessageResponse());
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter, DeadLetterQueueUrl = dlq };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Contains("\"extra_top\":{\"k\":[1,2]}", sent!.MessageBody, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -165,5 +302,190 @@ public sealed class SqsConsumerTests
         var mock = MockReceiving(null);
         var processed = await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>()).PollAsync();
         Assert.Equal(0, processed);
+    }
+
+    private static Message SeedWith(string body, string receiptHandle) => new()
+    {
+        Body = body,
+        ReceiptHandle = receiptHandle,
+        Attributes = new Dictionary<string, string> { ["ApproximateReceiveCount"] = "1" },
+    };
+
+    [Fact]
+    public async Task FailingReleaseIsReportedAndTheBatchContinues()
+    {
+        var mock = new Mock<IAmazonSQS>();
+        mock.Setup(c => c.ReceiveMessageAsync(It.IsAny<ReceiveMessageRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ReceiveMessageResponse
+            {
+                Messages = new List<Message> { SeedWith(Envelope(), "rh-bad"), SeedWith(Envelope(), "rh-good") },
+            });
+        mock.Setup(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ReceiptHandleIsInvalidException("expired"));
+        mock.Setup(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DeleteMessageResponse());
+        var errors = new List<Exception>();
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => ++calls == 1
+                ? throw new InvalidOperationException("boom")
+                : Task.CompletedTask,
+        };
+        var options = new SqsConsumerOptions { OnError = (e, _, _) => errors.Add(e) };
+
+        var processed = await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        Assert.Equal(2, processed);
+        Assert.Equal(2, calls);
+        Assert.IsType<InvalidOperationException>(errors[0]);
+        Assert.IsType<ReceiptHandleIsInvalidException>(errors[1]);
+        mock.Verify(c => c.DeleteMessageAsync(It.Is<DeleteMessageRequest>(r => r.ReceiptHandle == "rh-good"), It.IsAny<CancellationToken>()), Times.Once);
+        mock.Verify(c => c.DeleteMessageAsync(It.Is<DeleteMessageRequest>(r => r.ReceiptHandle == "rh-bad"), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task FailingUnknownUrnReleaseIsReported()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        mock.Setup(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new AmazonSQSException("throttled"));
+        Exception? captured = null;
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.Release,
+            OnError = (e, _, _) => captured = e,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.IsType<AmazonSQSException>(captured);
+    }
+
+    [Fact]
+    public async Task FailingDeadLetterSendIsReportedAndMessageNotDeleted()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new AmazonSQSException("MissingParameter"));
+        Exception? captured = null;
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Url + ".dlq",
+            OnError = (e, _, _) => captured = e,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.IsType<AmazonSQSException>(captured);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ThrowingHandlerOnShutdownSkipsRelease()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        using var cts = new CancellationTokenSource();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = async (_, _, ct) =>
+            {
+                await cts.CancelAsync();
+                ct.ThrowIfCancellationRequested();
+            },
+        };
+
+        await new SqsConsumer(mock.Object, Url, handlers).PollAsync(cts.Token);
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task FifoDeadLetterQueueGetsGroupAndDeduplicationIds()
+    {
+        const string dlq = Url + ".dlq.fifo";
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        SendMessageRequest? sent = null;
+        mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<SendMessageRequest, CancellationToken>((r, _) => sent = r)
+            .ReturnsAsync(new SendMessageResponse());
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter, DeadLetterQueueUrl = dlq };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.NotNull(sent);
+        Assert.Equal("orders", sent!.MessageGroupId);
+        Assert.False(string.IsNullOrEmpty(sent.MessageDeduplicationId));
+        Assert.Equal(EnvelopeCodec.Decode(sent.MessageBody).Meta!.Id, sent.MessageDeduplicationId);
+    }
+
+    [Fact]
+    public async Task StandardDeadLetterQueueHasNoGroupId()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        SendMessageRequest? sent = null;
+        mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<SendMessageRequest, CancellationToken>((r, _) => sent = r)
+            .ReturnsAsync(new SendMessageResponse());
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter, DeadLetterQueueUrl = Url + ".dlq" };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Null(sent!.MessageGroupId);
+        Assert.Null(sent.MessageDeduplicationId);
+    }
+
+    [Fact]
+    public async Task FailingDeleteAfterSuccessfulHandlerIsReportedDistinctlyAndNotReleased()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var throttled = new AmazonSQSException("RequestThrottled");
+        mock.Setup(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(throttled);
+        var errors = new List<Exception>();
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+        var options = new SqsConsumerOptions { OnError = (e, _, _) => errors.Add(e) };
+
+        var processed = await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        Assert.Equal(1, processed);
+        Assert.Equal(1, calls);
+        var error = Assert.Single(errors);
+        Assert.IsType<BabelQueueException>(error);
+        Assert.Same(throttled, error.InnerException);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task StrategyIsSnapshottedAtConstruction()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        Exception? captured = null;
+        var options = new SqsConsumerOptions { OnError = (e, _, _) => captured = e };
+        var consumer = new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options);
+
+        options.UnknownUrnStrategy = UnknownUrnStrategy.Delete;
+        await consumer.PollAsync();
+
+        Assert.IsType<UnknownUrnException>(captured);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("dead-letter")]
+    [InlineData("")]
+    [InlineData("FAIL")]
+    public void UnrecognisedUnknownUrnStrategyIsRejected(string strategy)
+    {
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = strategy };
+
+        Assert.Throws<ArgumentException>(
+            () => new SqsConsumer(new Mock<IAmazonSQS>().Object, Url, new Dictionary<string, BabelHandler>(), options));
     }
 }

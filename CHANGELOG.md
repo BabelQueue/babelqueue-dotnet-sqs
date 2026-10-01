@@ -9,6 +9,50 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-01
+
+MINOR: new public options and a changed failure-path behaviour (see below); no existing
+signature changed.
+
+### Changed
+- **Release uses the contract path (broker-bindings.md §3.5).** A throwing handler now always
+  releases the message with `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout = backoff)`
+  instead of silently waiting out the queue's visibility timeout; it is never deleted, so
+  `ApproximateReceiveCount` stays the attempt counter. New `SqsConsumerOptions.RetryBackoffSeconds`
+  (default `0` = redeliver now; clamped to 0–43200).
+- **⚠ Poison-loop risk.** With the default `0`, a message whose handler always throws is
+  redelivered immediately and indefinitely (previously it waited out the visibility timeout).
+  **Configure a native redrive policy** on the source queue (`RedrivePolicy` with a
+  `maxReceiveCount`, e.g. 5, targeting `<queue>.dlq`) so SQS moves it aside; set
+  `RetryBackoffSeconds` for a delay between attempts.
+- Require `BabelQueue.Core 1.8.0` — unknown envelope keys now survive every re-emit (dead-letter
+  included) and forbidden keys are dropped with a warning.
+
+### Added
+- **Unknown-URN strategies.** New `SqsConsumerOptions.UnknownUrnStrategy` (`fail` default — unchanged
+  behaviour — / `delete` / `release` / `dead_letter`), `UnknownUrnReleaseDelaySeconds` (default `0`,
+  applied via `ChangeMessageVisibility`; the same poison-loop caveat applies) and `DeadLetterQueueUrl`
+  (`dead_letter` sends the envelope with a `dead_letter` block to `<queue>.dlq`, then deletes;
+  degrades to delete without a DLQ URL). A FIFO DLQ (`<queue>.dlq.fifo`) is sent with
+  `MessageGroupId = meta.queue` and `MessageDeduplicationId = meta.id`. An `OnUnknownUrn` hook
+  still takes precedence. An unrecognised strategy string is rejected by the `SqsConsumer`
+  constructor (`ArgumentException`).
+
+### Fixed
+- **The poll loop survives failure-path broker errors.** A failing release, dead-letter send or
+  unknown-URN delete (e.g. `ReceiptHandleIsInvalid` after the visibility window lapsed,
+  throttling, a network fault) is reported via `OnError` and the message is left to visibility
+  expiry; the rest of the batch keeps processing. On shutdown (cancelled token) a throwing
+  handler's release is skipped.
+- **A failing delete after a successful handler is no longer treated as a handler failure.** It
+  is reported via `OnError` as a `BabelQueueException` wrapping the broker error and the message
+  is **not** released (it returns on visibility expiry), so a throttled `DeleteMessage` no longer
+  triggers an immediate redelivery of an already-processed message.
+- `UnknownUrnStrategy` is snapshotted at construction; changing the options object afterwards
+  no longer bypasses validation.
+
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OTel `traceparent` propagation (ADR-0028).** `SqsPublisher.PublishWithHeadersAsync(urn, data,
   headers, traceId)` carries an out-of-band header carrier (e.g. a W3C `traceparent` from
@@ -38,5 +82,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   with a Moq-mocked `IAmazonSQS` (no AWS, no network). The envelope is unchanged
   (`schema_version: 1`); SQS is purely additive.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/releases/tag/v1.0.0
