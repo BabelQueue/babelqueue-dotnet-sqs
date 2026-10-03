@@ -32,7 +32,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AWSSDK.SQS" Version="4.0.3.3" />
+    <PackageReference Include="AWSSDK.SQS" Version="4.0.100.15" />
     <PackageReference Include="BabelQueue.Core" Version="1.8.0" />
   </ItemGroup>
 
