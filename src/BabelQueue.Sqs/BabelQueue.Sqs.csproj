@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>BabelQueue.Sqs</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <Authors>Muhammet Şafak</Authors>
     <Company>BabelQueue</Company>
     <Description>Amazon SQS transport for BabelQueue — a canonical-envelope publisher and a URN-routed consumer over the AWS SDK for .NET, on the framework-agnostic core.</Description>

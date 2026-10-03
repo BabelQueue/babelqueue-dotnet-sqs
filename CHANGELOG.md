@@ -9,6 +9,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-03
+
+### Changed
+- Raise the `AWSSDK.SQS` floor from 4.0.3.3 to 4.0.100.15. No API or behaviour change.
+
 ## [1.2.0] - 2026-10-03
 
 MINOR: new public options and a changed failure-path behaviour (see below); no existing
@@ -82,7 +87,8 @@ signature changed.
   with a Moq-mocked `IAmazonSQS` (no AWS, no network). The envelope is unchanged
   (`schema_version: 1`); SQS is purely additive.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-dotnet-sqs/releases/tag/v1.0.0
