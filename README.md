@@ -106,6 +106,8 @@ the failure path is reported via `OnError` and the message is left to visibility
 If the handler succeeds but the delete then fails, `OnError` receives a `BabelQueueException`
 wrapping the broker error; the message is **not** released, so it reappears once its
 visibility timeout expires and may be handled again (keep handlers idempotent).
+**Schema-version gate.** Before decoding, the consumer reads the `bq-schema-version` message attribute. Absent or blank (empty / ASCII whitespace) decodes as usual; any other value must be exactly `"1"` (ordinal, no trimming). Otherwise the body is **not decoded**, `OnError` receives the rejection and the message is left to SQS (never deleted), so the native redrive policy moves it aside.
+
 The envelope is unchanged (`schema_version` stays `1`); SQS is purely additive.
 
 ## OpenTelemetry `traceparent` propagation (ADR-0028)

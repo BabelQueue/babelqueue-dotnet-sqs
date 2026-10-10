@@ -78,4 +78,52 @@ public sealed class SqsConformanceTests
             Assert.Equal(expected, seen);
         }
     }
+
+    [Fact]
+    public async Task SchemaVersionGateMatchesGolden()
+    {
+        var gate = Sqs().GetProperty("schema_version_gate");
+        var property = gate.GetProperty("property").GetString()!;
+        var body = File.ReadAllText(Path.Combine(Dir, gate.GetProperty("fixture").GetString()!));
+        var job = EnvelopeCodec.Decode(body).Job!;
+
+        var cases = gate.GetProperty("cases").EnumerateArray().ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var absent = testCase.TryGetProperty("absent", out var a) && a.GetBoolean();
+            var value = absent ? null : testCase.GetProperty("value").GetString();
+            var expect = testCase.GetProperty("expect").GetString();
+
+            var message = new Message { Body = body, ReceiptHandle = "rh" };
+            if (!absent)
+            {
+                message.MessageAttributes = new Dictionary<string, MessageAttributeValue>
+                {
+                    [property] = new() { DataType = "String", StringValue = value },
+                };
+            }
+
+            var mock = new Mock<IAmazonSQS>();
+            mock.Setup(s => s.ReceiveMessageAsync(It.IsAny<ReceiveMessageRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ReceiveMessageResponse { Messages = new List<Message> { message } });
+            mock.Setup(s => s.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new DeleteMessageResponse());
+
+            var seen = 0;
+            var handlers = new Dictionary<string, BabelHandler>
+            {
+                [job] = (_, _, _) => { seen++; return Task.CompletedTask; },
+            };
+            await new SqsConsumer(mock.Object, Url, handlers).PollAsync();
+
+            var label = absent ? "<absent>" : $"'{value}'";
+            Assert.True(
+                (expect == "decode" ? 1 : 0) == seen,
+                $"{label}: expected {expect} but handler ran {seen} time(s)");
+            mock.Verify(
+                c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()),
+                expect == "decode" ? Times.Once() : Times.Never());
+        }
+    }
 }

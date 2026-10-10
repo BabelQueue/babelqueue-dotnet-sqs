@@ -16,10 +16,22 @@ namespace BabelQueue.Sqs;
 /// is reported through <see cref="SqsConsumerOptions.OnError"/> and the message is left
 /// to SQS's visibility expiry. A failing delete after a successful handler is reported as a
 /// <see cref="BabelQueueException"/> wrapping the broker error and is never released.
+/// <para>
+/// Per §3.7 the <c>bq-schema-version</c> message attribute is checked <b>before</b> the body is
+/// decoded: when it is present and is not exactly the schema version the core supports
+/// (<see cref="EnvelopeCodec.SchemaVersion"/>, compared exactly as sent, as its canonical decimal string, with no
+/// trimming — so <c>"2"</c>, <c>"x"</c>, <c>"01"</c> and <c>" 1"</c> are all unknown), the body is never decoded or routed;
+/// <c>OnError</c> is notified (with an empty, undecoded envelope) and the message is neither deleted
+/// nor released, so SQS redelivers it on visibility expiry and its redrive policy moves it to the DLQ
+/// — the same path as a non-conformant envelope. A missing or blank (empty or ASCII-whitespace-only: space,
+/// tab, LF, VT, FF, CR) attribute changes nothing, and a <c>"1"</c> attribute still goes through the
+/// post-decode <see cref="EnvelopeCodec.Accepts"/> check.
+/// </para>
 /// </summary>
 public sealed class SqsConsumer
 {
     private const string ReceiveCountAttribute = "ApproximateReceiveCount";
+    private const string SchemaVersionAttribute = "bq-schema-version";
     private const int MaxVisibilityTimeoutSeconds = 43200;
 
     private readonly IAmazonSQS _client;
@@ -95,6 +107,26 @@ public sealed class SqsConsumer
 
     private async Task HandleAsync(Message message, CancellationToken cancellationToken)
     {
+        // §3.7: version-gate on the attribute before decoding the body. The value is compared exactly
+        // as sent (no trimming), like the Pulsar/Go/Python/Node consumers (GR-5).
+        var declaredVersion = SchemaVersionValue(message);
+        if (declaredVersion is not null && !IsBlankSchemaVersion(declaredVersion)
+            && !string.Equals(
+                declaredVersion,
+                EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal))
+        {
+            // The body is deliberately not decoded, so hand OnError an empty envelope. The message is
+            // neither deleted nor released: SQS redelivers it and the redrive policy dead-letters it.
+            _options.OnError?.Invoke(
+                new BabelQueueException(
+                    $"Rejected an SQS message: unsupported {SchemaVersionAttribute} attribute '{declaredVersion}' "
+                    + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
+                new Envelope(null, null, null, null, 0, null),
+                message);
+            return;
+        }
+
         var envelope = Reconcile(
             EnvelopeCodec.Decode(message.Body ?? string.Empty),
             ReceiveCount(message));
@@ -278,6 +310,31 @@ public sealed class SqsConsumer
                 VisibilityTimeout = Math.Clamp(delaySeconds, 0, MaxVisibilityTimeoutSeconds),
             },
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The <c>bq-schema-version</c> attribute's string value exactly as sent, or <c>null</c> when absent.</summary>
+    private static string? SchemaVersionValue(Message message)
+        => message.MessageAttributes is not null
+            && message.MessageAttributes.TryGetValue(SchemaVersionAttribute, out var attribute)
+            ? attribute?.StringValue
+            : null;
+
+    /// <summary>
+    /// The shared cross-SDK "blank" definition for <c>bq-schema-version</c>: the empty string, or a value made up
+    /// <b>only</b> of ASCII whitespace (space, <c>\t</c>, <c>\n</c>, U+000B, <c>\f</c>, <c>\r</c>). Anything else
+    /// (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike <see cref="string.IsNullOrWhiteSpace"/>.
+    /// </summary>
+    private static bool IsBlankSchemaVersion(string value)
+    {
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string? ReceiveCount(Message message)

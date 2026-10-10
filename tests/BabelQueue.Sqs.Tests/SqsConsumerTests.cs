@@ -247,6 +247,69 @@ public sealed class SqsConsumerTests
         mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    private static Message WithSchemaVersion(string body, string? version)
+    {
+        var message = Seed(body, 1);
+        if (version is not null)
+        {
+            message.MessageAttributes = new Dictionary<string, MessageAttributeValue>
+            {
+                ["bq-schema-version"] = new() { DataType = "String", StringValue = version },
+            };
+        }
+
+        return message;
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" \t")]
+    [InlineData("1")]
+    public async Task SchemaVersionGateLetsAbsentBlankOrSupportedVersionThrough(string? version)
+    {
+        var mock = MockReceiving(WithSchemaVersion(Envelope(), version));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, handlers).PollAsync();
+
+        Assert.Equal(1, calls);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    [InlineData(" 1")]
+    public async Task UnsupportedSchemaVersionIsRejectedWithoutDecodingOrSettling(string version)
+    {
+        // The body is not valid JSON: if the gate decoded it first, Decode would throw instead of
+        // OnError receiving the gate's exception — so a clean OnError proves the body was never decoded.
+        var mock = MockReceiving(WithSchemaVersion("{ this is not json", version));
+        Exception? captured = null;
+        Envelope? capturedEnvelope = null;
+        var calls = 0;
+        var options = new SqsConsumerOptions { OnError = (e, env, _) => { captured = e; capturedEnvelope = env; } };
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        var processed = await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        Assert.Equal(1, processed);
+        Assert.Equal(0, calls);
+        Assert.IsType<BabelQueueException>(captured);
+        Assert.Contains("bq-schema-version", captured!.Message, StringComparison.Ordinal);
+        Assert.Null(capturedEnvelope!.Job);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     [Fact]
     public async Task UnknownUrnCallsHandlerThenDeletesOrReportsOnError()
     {
