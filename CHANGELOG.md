@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-10
+
 ### Fixed
 - `SqsConsumer` now checks the `bq-schema-version` message attribute **before** decoding the body (§3.7). A value other than exactly `"1"` (ordinal, untrimmed) is rejected without decoding: `OnError` is invoked and the message is neither deleted nor released, so the queue's redrive policy takes over. Absent or blank (empty / ASCII whitespace) falls through to the normal decode. Mirrors the Pulsar gate; no public API change.
 
