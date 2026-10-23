@@ -70,6 +70,11 @@ A throwing handler **releases** the message with
 SQS redelivers it (at-least-once) and `ApproximateReceiveCount` stays the attempt counter.
 `RetryBackoffSeconds` defaults to **`0` (redeliver immediately)**; it is clamped to 0–43200.
 
+For a growing delay use the ADR-0034 §9 options (`RetryBackoffSeconds` is an alias of `RetryBackoff`):
+`d(n) = min(RetryBackoffMax, RetryBackoff × RetryBackoffMultiplier^(n−1))` seconds, `n = ApproximateReceiveCount`
+(`RetryBackoffMax = 0` means no cap of its own; the 43200 s SQS ceiling always applies), and
+`RetryJitter = "full"` draws `uniform(0, d(n))`. Defaults (`0`, `1`, `0`, `"none"`) keep the constant behaviour.
+
 > **Poison-loop risk.** With the default `0`, a message whose handler always fails is
 > redelivered immediately, forever. Always give the source queue a native **redrive policy**
 > so SQS moves it aside after N receives, and set a backoff if you want a pause between attempts:

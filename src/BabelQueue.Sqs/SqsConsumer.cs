@@ -39,6 +39,7 @@ public sealed class SqsConsumer
     private readonly IReadOnlyDictionary<string, BabelHandler> _handlers;
     private readonly SqsConsumerOptions _options;
     private readonly string _unknownUrnStrategy;
+    private readonly RetryBackoff _retryBackoff;
 
     public SqsConsumer(
         IAmazonSQS client,
@@ -64,6 +65,7 @@ public sealed class SqsConsumer
 
         // Snapshot: SqsConsumerOptions is mutable, so a later assignment must not bypass validation.
         _unknownUrnStrategy = _options.UnknownUrnStrategy;
+        _retryBackoff = new RetryBackoff(_options);
     }
 
     private static bool IsKnownStrategy(string? strategy) => strategy is
@@ -164,7 +166,7 @@ public sealed class SqsConsumer
             if (!cancellationToken.IsCancellationRequested)
             {
                 await GuardAsync(
-                    () => ReleaseAsync(message, _options.RetryBackoffSeconds, cancellationToken),
+                    () => ReleaseAsync(message, HandlerBackoffSeconds(message), cancellationToken),
                     envelope, message, cancellationToken).ConfigureAwait(false);
             }
 
@@ -289,6 +291,19 @@ public sealed class SqsConsumer
         }
 
         await _client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The ADR-0034 §9 backoff for a failed handler: <c>n = ApproximateReceiveCount</c> (= attempts + 1),
+    /// rounded up to whole seconds (SQS visibility is integral) and clamped to the SQS range.
+    /// </summary>
+    private int HandlerBackoffSeconds(Message message)
+    {
+        var n = int.TryParse(ReceiveCount(message), NumberStyles.Integer, CultureInfo.InvariantCulture, out var count) && count > 1
+            ? count
+            : 1;
+        var delay = Math.Ceiling(_retryBackoff.DelaySeconds(n));
+        return (int)Math.Min(delay, MaxVisibilityTimeoutSeconds);
     }
 
     /// <summary>

@@ -9,6 +9,21 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- ADR-0034 section 9 retry backoff on `SqsConsumerOptions`: `RetryBackoff` (seconds, default `0`),
+  `RetryBackoffMultiplier` (default `1`), `RetryBackoffMax` (default `0` = no cap) and `RetryJitter`
+  (`"none"` default, or `"full"` = `uniform(0, d(n))`), `d(n) = min(max, base * multiplier^(n-1))` with
+  `n = ApproximateReceiveCount`. The SQS 12 h (43200 s) visibility ceiling still applies. Invalid values are
+  rejected by the `SqsConsumer` constructor.
+
+### Changed
+- `RetryBackoffSeconds` is now an alias of `RetryBackoff`; the defaults keep the previous behaviour (constant
+  delay, `0` = redeliver now, clamped to 0-43200). The formula is a local copy until `BabelQueue.Core`
+  ships `RetryBackoffPolicy` and this package references it. Maintenance note: once the core is published with
+  `RetryBackoffPolicy`, delete `src/BabelQueue.Sqs/RetryBackoff.cs` and use the core type, otherwise the two
+  copies of the formula will drift apart.
+- Conformance vendored at v1.6.0; CI verifies `fetch.sh` against a pinned sha256.
+
 ## [1.2.2] - 2026-10-10
 
 ### Fixed

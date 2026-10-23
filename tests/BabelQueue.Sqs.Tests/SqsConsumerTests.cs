@@ -120,6 +120,65 @@ public sealed class SqsConsumerTests
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(2, 2)]
+    [InlineData(4, 8)]
+    [InlineData(8, 10)]
+    public async Task ReleaseBackoffGrowsExponentiallyUpToTheCap(int receiveCount, int expected)
+    {
+        var mock = MockReceiving(Seed(Envelope(), receiveCount));
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+        var options = new SqsConsumerOptions { RetryBackoff = 1, RetryBackoffMultiplier = 2, RetryBackoffMax = 10 };
+
+        await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.VisibilityTimeout == expected),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task FullJitterStaysWithinTheDeterministicDelay()
+    {
+        var mock = MockReceiving(Seed(Envelope(), 1));
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            ["urn:babel:orders:created"] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+        var options = new SqsConsumerOptions { RetryBackoff = 30, RetryJitter = "full" };
+
+        await new SqsConsumer(mock.Object, Url, handlers, options).PollAsync();
+
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(
+            It.Is<ChangeMessageVisibilityRequest>(r => r.VisibilityTimeout >= 0 && r.VisibilityTimeout <= 30),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public void RetryBackoffSecondsIsAnAliasOfRetryBackoff()
+    {
+        var options = new SqsConsumerOptions { RetryBackoffSeconds = 30 };
+        Assert.Equal(30, options.RetryBackoff);
+        options.RetryBackoff = 2.5;
+        Assert.Equal(3, options.RetryBackoffSeconds);
+        options.RetryBackoffSeconds = -5;
+        Assert.Equal(0, options.RetryBackoff);
+    }
+
+    [Fact]
+    public void InvalidBackoffOptionsAreRejectedByTheConstructor()
+    {
+        var mock = new Mock<IAmazonSQS>();
+        var handlers = new Dictionary<string, BabelHandler>();
+        Assert.Throws<ArgumentException>(() => new SqsConsumer(mock.Object, Url, handlers, new SqsConsumerOptions { RetryBackoffMultiplier = 0 }));
+        Assert.Throws<ArgumentException>(() => new SqsConsumer(mock.Object, Url, handlers, new SqsConsumerOptions { RetryBackoffMax = -1 }));
+        Assert.Throws<ArgumentException>(() => new SqsConsumer(mock.Object, Url, handlers, new SqsConsumerOptions { RetryJitter = "equal" }));
+    }
+
     [Fact]
     public async Task ReleaseWithoutReceiptHandleIsSkipped()
     {

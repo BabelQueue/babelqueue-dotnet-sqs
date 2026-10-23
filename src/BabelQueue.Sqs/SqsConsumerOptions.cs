@@ -29,15 +29,43 @@ public sealed class SqsConsumerOptions
     public Func<Envelope, Message, CancellationToken, Task>? OnUnknownUrn { get; set; }
 
     /// <summary>
-    /// Backoff (seconds) applied when a handler throws: the message is released with
+    /// Base backoff (seconds) applied when a handler throws: the message is released with
     /// <c>ChangeMessageVisibility(VisibilityTimeout = backoff)</c> and is NOT deleted
     /// (broker-bindings.md §3.5) — <c>0</c> (the default) redelivers it now, <c>N</c> after
-    /// N seconds. Clamped to SQS's 0–43200 range. <c>ApproximateReceiveCount</c> stays the
+    /// N seconds. Together with <see cref="RetryBackoffMultiplier"/>, <see cref="RetryBackoffMax"/> and
+    /// <see cref="RetryJitter"/> it forms the ADR-0034 §9 formula
+    /// <c>d(n) = min(max, base * multiplier^(n-1))</c>, <c>n = ApproximateReceiveCount</c>
+    /// (= <c>attempts + 1</c>); with the defaults it is the constant delay it always was.
+    /// The result is clamped to SQS's 0–43200 range (<c>RetryBackoffMax = 0</c> means no cap of its
+    /// own — the SQS 12 h ceiling still applies). <c>ApproximateReceiveCount</c> stays the
     /// attempt counter. <b>Poison-loop risk:</b> with the default <c>0</c> a message whose
     /// handler always throws is redelivered immediately, forever — configure a native
     /// redrive policy (<c>maxReceiveCount</c> → <c>&lt;queue&gt;.dlq</c>) to bound retries.
+    /// Validated, together with the three options below, by the <see cref="SqsConsumer"/> constructor.
     /// </summary>
-    public int RetryBackoffSeconds { get; set; }
+    public double RetryBackoff { get; set; }
+
+    /// <summary>Growth factor per attempt (default <c>1</c> = constant; must be &gt; 0). ADR-0034 §9.</summary>
+    public double RetryBackoffMultiplier { get; set; } = 1;
+
+    /// <summary>Cap in seconds on the computed backoff (default <c>0</c> = no cap). ADR-0034 §9.</summary>
+    public double RetryBackoffMax { get; set; }
+
+    /// <summary>
+    /// <c>"none"</c> (default: the exact delay) or <c>"full"</c> (<c>uniform(0, d(n))</c>). ADR-0034 §9.
+    /// Any other value is rejected by the <see cref="SqsConsumer"/> constructor.
+    /// </summary>
+    public string RetryJitter { get; set; } = "none";
+
+    /// <summary>
+    /// Alias of <see cref="RetryBackoff"/> kept for compatibility (whole seconds; a negative value
+    /// reads as <c>0</c>, as it always was clamped to the SQS range).
+    /// </summary>
+    public int RetryBackoffSeconds
+    {
+        get => (int)Math.Min(int.MaxValue, Math.Ceiling(RetryBackoff));
+        set => RetryBackoff = Math.Max(0, value);
+    }
 
     /// <summary>
     /// What to do with a message whose URN has no handler (and no <see cref="OnUnknownUrn"/>):
