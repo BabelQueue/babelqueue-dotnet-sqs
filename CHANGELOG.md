@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
 ### Added
 - ADR-0034 section 9 retry backoff on `SqsConsumerOptions`: `RetryBackoff` (seconds, default `0`),
   `RetryBackoffMultiplier` (default `1`), `RetryBackoffMax` (default `0` = no cap) and `RetryJitter`
