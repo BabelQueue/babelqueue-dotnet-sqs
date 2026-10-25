@@ -9,6 +9,29 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0037 decisions 1 and 2. The envelope stays at `schema_version: 1`; every change is a consumer-side settle
+decision. Ships as a **MINOR**.
+
+### Changed
+
+- **Behaviour change (with `SqsConsumerOptions.DeadLetterQueueUrl` set): a poison body is dead-lettered at its first delivery.**
+  It is written to the DLQ as the ADR-0035 record (`reason: "poison"`, `dead_letter.original_queue` = the queue name; a strict
+  JSON object is spliced byte for byte, anything else is wrapped as `raw`) via `BabelQueue.Core`'s `PoisonRecord`, then deleted
+  after the write. Before, it was only reported and left to the native `RedrivePolicy`. A failed write leaves it undeleted
+  (reported). A FIFO DLQ gets `MessageGroupId` = the queue name and `MessageDeduplicationId` = the SQS message id.
+- **Behaviour change (with `DeadLetterQueueUrl` set): a `bq-schema-version`-gated message is written raw and deleted.** The
+  incoming body is copied exactly as received (no `dead_letter` block, no ADR-0035 wrapping) to the DLQ, then deleted, on the
+  first delivery.
+- **`UnknownUrnStrategy = delete` now drops a poison or gated message** (`DeleteMessage`); before it was left to the native
+  mechanism.
+- **Only the configured `UnknownUrnStrategy` decides a poison or gated message** (default `fail`; `release` behaves as
+  `fail`). The `OnUnknownUrn` hook, and its precedence over the strategy, apply to an unknown URN only — a hook-only consumer
+  never drops a gated message silently. The unknown-URN path is unchanged.
+- With no `DeadLetterQueueUrl` the behaviour is unchanged: the message is neither deleted nor released, so visibility expiry
+  redelivers it and the queue's `RedrivePolicy` applies (the `dead_letter` strategy with no DLQ URL behaves the same).
+- Vendored conformance suite updated to v1.8.0; CI pins v1.8.0. The runners cover the `poison_dlq` and `version_gate_sqs`
+  sections.
+
 ## [1.3.0] - 2026-10-24
 
 ### Added

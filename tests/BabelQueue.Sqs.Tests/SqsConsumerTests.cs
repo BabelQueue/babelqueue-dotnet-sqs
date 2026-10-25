@@ -369,6 +369,339 @@ public sealed class SqsConsumerTests
         mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    private const string Dlq = Url + ".dlq";
+
+    private static (Mock<IAmazonSQS> Mock, List<SendMessageRequest> Sent) MockWithDlq(Message message, Exception? sendFailure = null)
+    {
+        var mock = MockReceiving(message);
+        var sent = new List<SendMessageRequest>();
+        var setup = mock.Setup(c => c.SendMessageAsync(It.IsAny<SendMessageRequest>(), It.IsAny<CancellationToken>()));
+        if (sendFailure is not null)
+        {
+            setup.ThrowsAsync(sendFailure);
+        }
+        else
+        {
+            setup.Callback<SendMessageRequest, CancellationToken>((r, _) => sent.Add(r)).ReturnsAsync(new SendMessageResponse());
+        }
+
+        return (mock, sent);
+    }
+
+    private static Dictionary<string, BabelHandler> CountingHandler(Action onCall) => new()
+    {
+        ["urn:babel:orders:created"] = (_, _, _) => { onCall(); return Task.CompletedTask; },
+    };
+
+    [Theory]
+    [InlineData(UnknownUrnStrategy.Fail)]
+    [InlineData(UnknownUrnStrategy.Release)]
+    [InlineData(UnknownUrnStrategy.DeadLetter)]
+    public async Task VersionGatedMessageIsWrittenRawToTheDlqThenDeletedOnTheFirstDelivery(string strategy)
+    {
+        // ApproximateReceiveCount 9: the gate applies whatever the counters say, and the body is copied as received.
+        var body = "{\n  \"meta\": {\"schema_version\": 2}, \"job\": \"urn:babel:orders:created\"\n}\n";
+        var message = WithSchemaVersion(body, "2");
+        message.Attributes["ApproximateReceiveCount"] = "9";
+        var (mock, sent) = MockWithDlq(message);
+        var calls = 0;
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = strategy, DeadLetterQueueUrl = Dlq };
+
+        await new SqsConsumer(mock.Object, Url, CountingHandler(() => calls++), options).PollAsync();
+
+        Assert.Equal(0, calls);
+        var record = Assert.Single(sent);
+        Assert.Equal(Dlq, record.QueueUrl);
+        Assert.Equal(body, record.MessageBody);
+        Assert.DoesNotContain("dead_letter", record.MessageBody, StringComparison.Ordinal);
+        mock.Verify(c => c.DeleteMessageAsync(It.Is<DeleteMessageRequest>(r => r.ReceiptHandle == "rh-1"), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task VersionGatedMessageUnderDeleteStrategyIsDeletedWithoutARecord()
+    {
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(Envelope(), "2"));
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.Delete, DeadLetterQueueUrl = Dlq };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task VersionGatedMessageWithoutADlqIsLeftToTheNativeMechanism()
+    {
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(Envelope(), "2"));
+        Exception? reported = null;
+        var options = new SqsConsumerOptions { OnError = (e, _, _) => reported = e };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Empty(sent);
+        Assert.NotNull(reported);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task VersionGatedMessageWhoseDlqWriteFailsIsNotDeletedAndIsReported()
+    {
+        var (mock, _) = MockWithDlq(WithSchemaVersion(Envelope(), "2"), new AmazonSQSException("dlq down"));
+        var reported = new List<Exception>();
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, OnError = (e, _, _) => reported.Add(e) };
+
+        var processed = await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(1, processed);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Contains(reported, e => e is AmazonSQSException);
+        Assert.Contains(reported, e => e.Message.Contains("bq-schema-version", StringComparison.Ordinal));
+    }
+
+    // ADR-0037 "Configured strategy only": the OnUnknownUrn hook (and the precedence it has over the strategy for an unknown
+    // URN) must never change how a version-gated message is settled. Conformance runners configure no hook, so these
+    // unit tests are the only cover for it.
+
+    [Fact]
+    public async Task HookOnlyConsumerSettlesAVersionGatedMessageAsFailAndWritesItRawWithTheDlqOn()
+    {
+        var hookCalls = 0;
+        var body = Envelope();
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(body, "2"));
+        var options = new SqsConsumerOptions
+        {
+            DeadLetterQueueUrl = Dlq,
+            OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        Assert.Equal(body, Assert.Single(sent).MessageBody);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task HookOnlyConsumerLeavesAVersionGatedMessageToTheNativeMechanismWithTheDlqOff()
+    {
+        // The hook would otherwise imply `delete` (it takes precedence for an unknown URN): the gate must not drop it.
+        var hookCalls = 0;
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(Envelope(), "2"));
+        var options = new SqsConsumerOptions { OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; } };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task HookWithTheDeadLetterStrategyWritesAVersionGatedMessageRawWithTheDlqOn()
+    {
+        var hookCalls = 0;
+        var body = Envelope();
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(body, "2"));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Dlq,
+            OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        Assert.Equal(body, Assert.Single(sent).MessageBody);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task HookWithTheDeadLetterStrategyLeavesAVersionGatedMessageToTheNativeMechanismWithTheDlqOff()
+    {
+        var hookCalls = 0;
+        var (mock, sent) = MockWithDlq(WithSchemaVersion(Envelope(), "2"));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task TheHookStillAppliesToAnUnknownUrn()
+    {
+        // The unknown-URN path is unchanged: the hook runs, then the message is deleted.
+        var hookCalls = 0;
+        var (mock, sent) = MockWithDlq(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions
+        {
+            DeadLetterQueueUrl = Dlq,
+            OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(1, hookCalls);
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PoisonBodyIsWrittenAsAnAdr0035RecordToTheDlqThenDeleted()
+    {
+        var (mock, sent) = MockWithDlq(Seed("{\"not\":\"an envelope\"}", 3));
+        var calls = 0;
+        Exception? reported = null;
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, OnError = (e, _, _) => reported = e };
+
+        await new SqsConsumer(mock.Object, Url, CountingHandler(() => calls++), options).PollAsync();
+
+        Assert.Equal(0, calls);
+        Assert.NotNull(reported);
+        var record = Assert.Single(sent);
+        Assert.Equal(Dlq, record.QueueUrl);
+        using var doc = System.Text.Json.JsonDocument.Parse(record.MessageBody);
+        Assert.Equal("an envelope", doc.RootElement.GetProperty("not").GetString());
+        var block = doc.RootElement.GetProperty("dead_letter");
+        Assert.Equal("poison", block.GetProperty("reason").GetString());
+        Assert.Equal("orders", block.GetProperty("original_queue").GetString());
+        Assert.Equal(2, block.GetProperty("attempts").GetInt32());
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task NonJsonPoisonBodyIsWrappedAsRaw()
+    {
+        var (mock, sent) = MockWithDlq(Seed("plain text", 1));
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), new SqsConsumerOptions { DeadLetterQueueUrl = Dlq }).PollAsync();
+
+        using var doc = System.Text.Json.JsonDocument.Parse(Assert.Single(sent).MessageBody);
+        Assert.Equal("plain text", doc.RootElement.GetProperty("raw").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("raw_encoding", out _));
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // ADR-0037 "Configured strategy only" for the poison route: the OnUnknownUrn hook (and the `delete` it would imply, or
+    // its precedence over the strategy) must never drop a poison body silently.
+
+    [Fact]
+    public async Task HookOnlyConsumerWritesAPoisonRecordWithTheDlqOn()
+    {
+        var hookCalls = 0;
+        var (mock, sent) = MockWithDlq(Seed("junk", 1));
+        var options = new SqsConsumerOptions
+        {
+            DeadLetterQueueUrl = Dlq,
+            OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        using var doc = System.Text.Json.JsonDocument.Parse(Assert.Single(sent).MessageBody);
+        Assert.Equal("poison", doc.RootElement.GetProperty("dead_letter").GetProperty("reason").GetString());
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task HookOnlyConsumerLeavesAPoisonBodyToTheNativeMechanismWithTheDlqOff()
+    {
+        var hookCalls = 0;
+        var (mock, sent) = MockWithDlq(Seed("junk", 1));
+        var options = new SqsConsumerOptions { OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; } };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(0, hookCalls);
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task HookWithTheDeadLetterStrategyHandlesPoisonByTheDlqState()
+    {
+        var hookCalls = 0;
+        foreach (var dlqOn in new[] { true, false })
+        {
+            var (mock, sent) = MockWithDlq(Seed("junk", 1));
+            var options = new SqsConsumerOptions
+            {
+                UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+                DeadLetterQueueUrl = dlqOn ? Dlq : null,
+                OnUnknownUrn = (_, _, _) => { hookCalls++; return Task.CompletedTask; },
+            };
+
+            await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+            Assert.Equal(dlqOn ? 1 : 0, sent.Count);
+            mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), dlqOn ? Times.Once() : Times.Never());
+        }
+
+        Assert.Equal(0, hookCalls);
+    }
+
+    [Fact]
+    public async Task PoisonBodyToAFifoDlqGetsGroupAndDeduplicationIds()
+    {
+        var message = Seed("junk", 1);
+        message.MessageId = "sqs-msg-1";
+        var (mock, sent) = MockWithDlq(message);
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Url + ".dlq.fifo" };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        var record = Assert.Single(sent);
+        Assert.Equal("orders", record.MessageGroupId);
+        Assert.Equal("sqs-msg-1", record.MessageDeduplicationId);
+    }
+
+    [Fact]
+    public async Task PoisonBodyUnderDeleteStrategyIsDeletedWithoutARecord()
+    {
+        var (mock, sent) = MockWithDlq(Seed("junk", 1));
+        var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.Delete, DeadLetterQueueUrl = Dlq };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PoisonBodyWithoutADlqIsLeftToTheNativeRedrivePolicy()
+    {
+        var (mock, sent) = MockWithDlq(Seed("junk", 1));
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>()).PollAsync();
+
+        Assert.Empty(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        mock.Verify(c => c.ChangeMessageVisibilityAsync(It.IsAny<ChangeMessageVisibilityRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PoisonBodyWhoseDlqWriteFailsIsNotDeleted()
+    {
+        var (mock, _) = MockWithDlq(Seed("junk", 1), new AmazonSQSException("dlq down"));
+        var reported = new List<Exception>();
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, OnError = (e, _, _) => reported.Add(e) };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Contains(reported, e => e is AmazonSQSException);
+    }
+
     [Fact]
     public async Task UnknownUrnCallsHandlerThenDeletesOrReportsOnError()
     {

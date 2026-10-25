@@ -1,4 +1,8 @@
+using System.Diagnostics;
 using System.Globalization;
+using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 
@@ -20,12 +24,23 @@ namespace BabelQueue.Sqs;
 /// Per §3.7 the <c>bq-schema-version</c> message attribute is checked <b>before</b> the body is
 /// decoded: when it is present and is not exactly the schema version the core supports
 /// (<see cref="EnvelopeCodec.SchemaVersion"/>, compared exactly as sent, as its canonical decimal string, with no
-/// trimming — so <c>"2"</c>, <c>"x"</c>, <c>"01"</c> and <c>" 1"</c> are all unknown), the body is never decoded or routed;
-/// <c>OnError</c> is notified (with an empty, undecoded envelope) and the message is neither deleted
-/// nor released, so SQS redelivers it on visibility expiry and its redrive policy moves it to the DLQ
-/// — the same path as a non-conformant envelope. A missing or blank (empty or ASCII-whitespace-only: space,
-/// tab, LF, VT, FF, CR) attribute changes nothing, and a <c>"1"</c> attribute still goes through the
-/// post-decode <see cref="EnvelopeCodec.Accepts"/> check.
+/// trimming — so <c>"2"</c>, <c>"x"</c>, <c>"01"</c> and <c>" 1"</c> are all unknown), the body is never decoded or routed
+/// and <c>OnError</c> is notified (with an empty, undecoded envelope). It is settled on its <b>first delivery</b>
+/// (ADR-0037 decision 1), whatever <c>ApproximateReceiveCount</c> says: under <c>UnknownUrnStrategy = delete</c> it is
+/// deleted (dropped); with <see cref="SqsConsumerOptions.DeadLetterQueueUrl"/> set the body is written <b>exactly as
+/// received</b> (no <c>dead_letter</c> block) to the DLQ and then deleted — a failed write leaves it undeleted and is
+/// reported; with no DLQ it is left to the queue's native mechanism (not deleted, not released: visibility expiry
+/// redelivers it and the redrive policy moves it to the native DLQ after <c>maxReceiveCount</c>). Only the explicitly
+/// configured <see cref="SqsConsumerOptions.UnknownUrnStrategy"/> is read (default <c>fail</c>;
+/// <c>release</c> behaves as <c>fail</c>); the <see cref="SqsConsumerOptions.OnUnknownUrn"/> hook never applies to it.
+/// A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) attribute changes nothing, and a
+/// <c>"1"</c> attribute still goes through the post-decode <see cref="EnvelopeCodec.Accepts"/> check.
+/// </para>
+/// <para>
+/// A poison body (not a JSON object, no valid <c>job</c>/<c>urn</c> identity, or any other non-conformant envelope) is
+/// never handed to a handler and never retried (ADR-0037 decision 2). It follows the same settle: <c>delete</c> drops it;
+/// with a DLQ URL the ADR-0035 record (<c>reason: "poison"</c>) is written to the DLQ and the message deleted after the
+/// write; with no DLQ it is left to the native mechanism.
 /// </para>
 /// </summary>
 public sealed class SqsConsumer
@@ -118,14 +133,14 @@ public sealed class SqsConsumer
                 EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
                 StringComparison.Ordinal))
         {
-            // The body is deliberately not decoded, so hand OnError an empty envelope. The message is
-            // neither deleted nor released: SQS redelivers it and the redrive policy dead-letters it.
-            _options.OnError?.Invoke(
-                new BabelQueueException(
-                    $"Rejected an SQS message: unsupported {SchemaVersionAttribute} attribute '{declaredVersion}' "
-                    + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
-                new Envelope(null, null, null, null, 0, null),
-                message);
+            // ADR-0037 decision 1: settled on the first delivery, never decoded, never retried. The body is deliberately
+            // not decoded, so OnError gets an empty envelope.
+            var rejected = new BabelQueueException(
+                $"Rejected an SQS message: unsupported {SchemaVersionAttribute} attribute '{declaredVersion}' "
+                + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded.");
+            var empty = new Envelope(null, null, null, null, 0, null);
+            await SettleTerminalAsync(message, () => message.Body ?? string.Empty, empty, rejected, cancellationToken)
+                .ConfigureAwait(false);
             return;
         }
 
@@ -135,9 +150,20 @@ public sealed class SqsConsumer
 
         if (!EnvelopeCodec.Accepts(envelope))
         {
-            _options.OnError?.Invoke(
-                new BabelQueueException("Rejected a non-conformant BabelQueue envelope from SQS."),
-                envelope, message);
+            // ADR-0037 decision 2: the poison route -- the ADR-0035 record to the DLQ, never a retry.
+            var cause = new BabelQueueException("Rejected a non-conformant BabelQueue envelope from SQS.");
+            await SettleTerminalAsync(
+                message,
+                () => Encoding.UTF8.GetString(PoisonBody(
+                    Encoding.UTF8.GetBytes(message.Body ?? string.Empty),
+                    cause.Message,
+                    cause.GetType().FullName,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    SqsPublisher.QueueName(_queueUrl),
+                    envelope.Attempts)),
+                envelope,
+                cause,
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -180,6 +206,93 @@ public sealed class SqsConsumer
         await GuardAsync(
             () => DeleteHandledAsync(message, cancellationToken),
             envelope, message, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// ADR-0037 decisions 1 and 2: settle a delivery that is terminal on its first delivery (a version-gated message or a
+    /// poison body). Reads only the configured <c>UnknownUrnStrategy</c> (never the <c>OnUnknownUrn</c> hook):
+    /// <c>delete</c> deletes it; with a DLQ URL the record from <paramref name="record"/> is written to the DLQ and the
+    /// message deleted only after the write succeeded (a failed write leaves it undeleted: unsettled, reported); with no
+    /// DLQ it is handed to the native mechanism -- not deleted, not released -- so visibility expiry redelivers it and the
+    /// queue's <c>RedrivePolicy</c> applies. The rejection is reported after the settle.
+    /// </summary>
+    private async Task SettleTerminalAsync(
+        Message message,
+        Func<string> record,
+        Envelope envelope,
+        BabelQueueException rejected,
+        CancellationToken cancellationToken)
+    {
+        if (_unknownUrnStrategy == UnknownUrnStrategy.Delete)
+        {
+            await GuardAsync(() => DeleteAsync(message, cancellationToken), envelope, message, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (!string.IsNullOrEmpty(_options.DeadLetterQueueUrl))
+        {
+            await GuardAsync(
+                async () =>
+                {
+                    await WriteDeadLetterRecordAsync(message, record(), cancellationToken).ConfigureAwait(false);
+                    await DeleteAsync(message, cancellationToken).ConfigureAwait(false);
+                },
+                envelope,
+                message,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Dead-lettering off (or the dead_letter strategy with no DLQ URL): native. Neither deleted nor released.
+            Trace.TraceWarning(
+                "BabelQueue.Sqs: left a terminal message on its first delivery to the queue's native mechanism "
+                + "(no DeadLetterQueueUrl): visibility expiry redelivers it and the RedrivePolicy applies.");
+        }
+
+        _options.OnError?.Invoke(rejected, envelope, message);
+    }
+
+    /// <summary>Writes <paramref name="body"/> as the body of a new message on the DLQ (FIFO: group = queue name, dedupe = SQS message id).</summary>
+    private async Task WriteDeadLetterRecordAsync(Message message, string body, CancellationToken cancellationToken)
+    {
+        var request = new SendMessageRequest { QueueUrl = _options.DeadLetterQueueUrl, MessageBody = body };
+        if (_options.DeadLetterQueueUrl!.EndsWith(".fifo", StringComparison.Ordinal))
+        {
+            request.MessageGroupId = SqsPublisher.QueueName(_queueUrl);
+            request.MessageDeduplicationId = string.IsNullOrEmpty(message.MessageId) ? Guid.NewGuid().ToString("N") : message.MessageId;
+        }
+
+        await _client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static readonly JsonWriterOptions PoisonWriterOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        Indented = false,
+    };
+
+    /// <summary>
+    /// The poison DLQ record (ADR-0035, <see cref="PoisonRecord"/>): a body that is a strict JSON object without a
+    /// top-level <c>dead_letter</c> key is spliced byte for byte; anything else is carried as <c>raw</c> (plain text when
+    /// valid UTF-8, otherwise base64 plus <c>raw_encoding: "base64"</c>). The <c>dead_letter</c> block has reason
+    /// <c>poison</c>.
+    /// </summary>
+    internal static byte[] PoisonBody(byte[] body, string? error, string? exception, long failedAt, string originalQueue, int attempts)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, PoisonWriterOptions))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("reason", "poison");
+            if (error is null) { writer.WriteNull("error"); } else { writer.WriteString("error", error); }
+            if (exception is null) { writer.WriteNull("exception"); } else { writer.WriteString("exception", exception); }
+            writer.WriteNumber("failed_at", failedAt);
+            writer.WriteString("original_queue", originalQueue);
+            writer.WriteNumber("attempts", attempts);
+            writer.WriteString("lang", EnvelopeCodec.SourceLang);
+            writer.WriteEndObject();
+        }
+
+        return PoisonRecord.Build(body, Encoding.UTF8.GetString(stream.ToArray()));
     }
 
     private async Task DeleteHandledAsync(Message message, CancellationToken cancellationToken)
