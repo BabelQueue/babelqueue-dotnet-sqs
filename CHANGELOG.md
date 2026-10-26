@@ -32,6 +32,10 @@ decision. Ships as a **MINOR**.
 - Vendored conformance suite updated to v1.8.0; CI pins v1.8.0. The runners cover the `poison_dlq` and `version_gate_sqs`
   sections.
 
+### Docs
+
+- The BabelQueue DLQ on SQS is `<queue>-dlq` (FIFO `<queue>-dlq.fifo`), not `<queue>.dlq`: an SQS queue name cannot contain a dot (ADR-0037 decision 7). README and XML docs only; `DeadLetterQueueUrl` is an explicit URL, so no code change.
+
 ## [1.3.0] - 2026-10-24
 
 ### Added

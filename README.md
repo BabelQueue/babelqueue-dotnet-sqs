@@ -80,7 +80,7 @@ For a growing delay use the ADR-0034 §9 options (`RetryBackoffSeconds` is an al
 > so SQS moves it aside after N receives, and set a backoff if you want a pause between attempts:
 >
 > ```json
-> { "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:…:orders.dlq\",\"maxReceiveCount\":\"5\"}" }
+> { "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:…:orders-dlq\",\"maxReceiveCount\":\"5\"}" }
 > ```
 
 A message whose URN has no handler follows `UnknownUrnStrategy` (an `OnUnknownUrn` hook,
@@ -93,7 +93,7 @@ when set, takes precedence and the message is then deleted):
 | `release` | `ChangeMessageVisibility(UnknownUrnReleaseDelaySeconds)` — default `0`, same poison-loop caveat |
 | `dead_letter` | send to `DeadLetterQueueUrl` with a `dead_letter` block (reason `unknown_urn`), then delete; no DLQ URL → delete |
 
-A FIFO DLQ (`<queue>.dlq.fifo`) is sent with `MessageGroupId = meta.queue` and
+The DLQ is named `<queue>-dlq` (an SQS queue name cannot contain a dot). A FIFO DLQ (`<queue>-dlq.fifo`) is sent with `MessageGroupId = meta.queue` and
 `MessageDeduplicationId = meta.id`. Any other strategy string is rejected by the constructor.
 
 ```csharp

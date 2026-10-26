@@ -42,7 +42,7 @@ public sealed class SqsConsumerOptions
     /// own — the SQS 12 h ceiling still applies). <c>ApproximateReceiveCount</c> stays the
     /// attempt counter. <b>Poison-loop risk:</b> with the default <c>0</c> a message whose
     /// handler always throws is redelivered immediately, forever — configure a native
-    /// redrive policy (<c>maxReceiveCount</c> → <c>&lt;queue&gt;.dlq</c>) to bound retries.
+    /// redrive policy (<c>maxReceiveCount</c> → <c>&lt;queue&gt;-dlq</c>) to bound retries.
     /// Validated, together with the three options below, by the <see cref="SqsConsumer"/> constructor.
     /// </summary>
     public double RetryBackoff { get; set; }
@@ -93,7 +93,7 @@ public sealed class SqsConsumerOptions
     public int UnknownUrnReleaseDelaySeconds { get; set; }
 
     /// <summary>
-    /// URL of the <c>&lt;queue&gt;.dlq</c> (or FIFO <c>&lt;queue&gt;.dlq.fifo</c>, sent with
+    /// URL of the <c>&lt;queue&gt;-dlq</c> (or FIFO <c>&lt;queue&gt;-dlq.fifo</c>, sent with
     /// <c>MessageGroupId = meta.queue</c> and <c>MessageDeduplicationId = meta.id</c>) queue used by the <c>dead_letter</c> unknown-URN
     /// strategy, and the target of a poison record and of a raw schema-version-gated body (ADR-0037); <c>null</c>
     /// disables the DLQ (the unknown-URN strategy then degrades to delete; a poison or gated message is left to the

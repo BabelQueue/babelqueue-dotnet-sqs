@@ -390,7 +390,7 @@ public sealed class SqsConsumer
             MessageAttributes = SqsAttributes.Project(dead),
         };
 
-        // A FIFO DLQ (<queue>.dlq.fifo, broker-bindings.md §3) requires a group id; dedupe on
+        // A FIFO DLQ (<queue>-dlq.fifo, broker-bindings.md §3) requires a group id; dedupe on
         // meta.id, matching SqsPublisher.
         if (_options.DeadLetterQueueUrl.EndsWith(".fifo", StringComparison.Ordinal))
         {
