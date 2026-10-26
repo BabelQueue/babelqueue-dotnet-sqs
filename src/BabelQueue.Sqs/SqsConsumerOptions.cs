@@ -24,7 +24,9 @@ public sealed class SqsConsumerOptions
 
     /// <summary>
     /// Called instead of erroring when a URN has no handler; the message is then deleted.
-    /// When set, it takes precedence over <see cref="UnknownUrnStrategy"/>.
+    /// When set, it takes precedence over <see cref="UnknownUrnStrategy"/> for an unknown URN <b>only</b>: it never
+    /// affects a schema-version-gated message or a poison body (ADR-0037), which read the configured
+    /// <see cref="UnknownUrnStrategy"/> alone (default <c>fail</c>).
     /// </summary>
     public Func<Envelope, Message, CancellationToken, Task>? OnUnknownUrn { get; set; }
 
@@ -40,7 +42,7 @@ public sealed class SqsConsumerOptions
     /// own — the SQS 12 h ceiling still applies). <c>ApproximateReceiveCount</c> stays the
     /// attempt counter. <b>Poison-loop risk:</b> with the default <c>0</c> a message whose
     /// handler always throws is redelivered immediately, forever — configure a native
-    /// redrive policy (<c>maxReceiveCount</c> → <c>&lt;queue&gt;.dlq</c>) to bound retries.
+    /// redrive policy (<c>maxReceiveCount</c> → <c>&lt;queue&gt;-dlq</c>) to bound retries.
     /// Validated, together with the three options below, by the <see cref="SqsConsumer"/> constructor.
     /// </summary>
     public double RetryBackoff { get; set; }
@@ -76,7 +78,10 @@ public sealed class SqsConsumerOptions
     /// <see cref="DeadLetterQueueUrl"/> with a <c>dead_letter</c> block, then delete; degrades
     /// to delete when no DLQ URL is configured). Any other value is rejected by the
     /// <see cref="SqsConsumer"/> constructor with an <see cref="ArgumentException"/>; the value
-    /// is read once, at construction.
+    /// is read once, at construction. The configured value also decides a schema-version-gated message and a poison
+    /// body (ADR-0037): <c>delete</c> deletes them; otherwise they are written to <see cref="DeadLetterQueueUrl"/>
+    /// (raw body for a gated message, the ADR-0035 record for a poison body) and deleted, or, with no DLQ URL,
+    /// left to the queue's native <c>RedrivePolicy</c> (<c>release</c> behaves as <c>fail</c>).
     /// </summary>
     public string UnknownUrnStrategy { get; set; } = BabelQueue.UnknownUrnStrategy.Fail;
 
@@ -88,9 +93,13 @@ public sealed class SqsConsumerOptions
     public int UnknownUrnReleaseDelaySeconds { get; set; }
 
     /// <summary>
-    /// URL of the <c>&lt;queue&gt;.dlq</c> (or FIFO <c>&lt;queue&gt;.dlq.fifo</c>, sent with
+    /// URL of the <c>&lt;queue&gt;-dlq</c> (or FIFO <c>&lt;queue&gt;-dlq.fifo</c>, sent with
     /// <c>MessageGroupId = meta.queue</c> and <c>MessageDeduplicationId = meta.id</c>) queue used by the <c>dead_letter</c> unknown-URN
-    /// strategy; <c>null</c> disables the DLQ (the strategy then degrades to delete).
+    /// strategy, and the target of a poison record and of a raw schema-version-gated body (ADR-0037); <c>null</c>
+    /// disables the DLQ (the unknown-URN strategy then degrades to delete; a poison or gated message is left to the
+    /// native mechanism).
+    /// Poison and schema-version-gated records sent to a FIFO DLQ carry <c>MessageGroupId</c> = the queue name and
+    /// <c>MessageDeduplicationId</c> = the SQS message id (not <c>meta.queue</c> / <c>meta.id</c>: there is no usable envelope).
     /// </summary>
     public string? DeadLetterQueueUrl { get; set; }
 }

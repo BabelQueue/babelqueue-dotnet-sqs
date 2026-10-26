@@ -80,7 +80,7 @@ For a growing delay use the ADR-0034 §9 options (`RetryBackoffSeconds` is an al
 > so SQS moves it aside after N receives, and set a backoff if you want a pause between attempts:
 >
 > ```json
-> { "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:…:orders.dlq\",\"maxReceiveCount\":\"5\"}" }
+> { "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:…:orders-dlq\",\"maxReceiveCount\":\"5\"}" }
 > ```
 
 A message whose URN has no handler follows `UnknownUrnStrategy` (an `OnUnknownUrn` hook,
@@ -93,7 +93,7 @@ when set, takes precedence and the message is then deleted):
 | `release` | `ChangeMessageVisibility(UnknownUrnReleaseDelaySeconds)` — default `0`, same poison-loop caveat |
 | `dead_letter` | send to `DeadLetterQueueUrl` with a `dead_letter` block (reason `unknown_urn`), then delete; no DLQ URL → delete |
 
-A FIFO DLQ (`<queue>.dlq.fifo`) is sent with `MessageGroupId = meta.queue` and
+The DLQ is named `<queue>-dlq` (an SQS queue name cannot contain a dot). A FIFO DLQ (`<queue>-dlq.fifo`) is sent with `MessageGroupId = meta.queue` and
 `MessageDeduplicationId = meta.id`. Any other strategy string is rejected by the constructor.
 
 ```csharp
@@ -111,7 +111,15 @@ the failure path is reported via `OnError` and the message is left to visibility
 If the handler succeeds but the delete then fails, `OnError` receives a `BabelQueueException`
 wrapping the broker error; the message is **not** released, so it reappears once its
 visibility timeout expires and may be handled again (keep handlers idempotent).
-**Schema-version gate.** Before decoding, the consumer reads the `bq-schema-version` message attribute. Absent or blank (empty / ASCII whitespace) decodes as usual; any other value must be exactly `"1"` (ordinal, no trimming). Otherwise the body is **not decoded**, `OnError` receives the rejection and the message is left to SQS (never deleted), so the native redrive policy moves it aside.
+**Schema-version gate and poison (ADR-0037).** Before decoding, the consumer reads the `bq-schema-version` message attribute. Absent or blank (empty / ASCII whitespace) decodes as usual; any other value must be exactly `"1"` (ordinal, no trimming). Otherwise the body is **not decoded**, `OnError` receives the rejection and the message is settled on its **first delivery** (whatever `ApproximateReceiveCount` says), never handed to a handler. A **poison body** (not a JSON object, no valid `job`/`urn`, any other non-conformant envelope) follows the same settle. Both read **only the configured `UnknownUrnStrategy`** (default `fail`; `release` behaves as `fail`) — an `OnUnknownUrn` hook affects an unknown URN only, never these:
+
+| Configuration | Effect |
+| :--- | :--- |
+| `UnknownUrnStrategy = delete` | `DeleteMessage` (dropped) |
+| `DeadLetterQueueUrl` set | write to the DLQ, then `DeleteMessage`: the **incoming body exactly as received** for a gated message (no `dead_letter` block); the **ADR-0035 record** (`reason: "poison"`) for a poison body. A failed write leaves the message undeleted (reported via `OnError`); visibility expiry redelivers it |
+| no `DeadLetterQueueUrl` (also `dead_letter` strategy) | **native**: neither deleted nor released — visibility expiry redelivers it and the queue's `RedrivePolicy` moves it aside after `maxReceiveCount` (otherwise it is kept until retention ends). Configure a `RedrivePolicy` |
+
+**Behaviour change:** with a `DeadLetterQueueUrl`, a poison or gated message is now dead-lettered at its first delivery instead of being redelivered toward the native mechanism, and under `delete` it is dropped. With no DLQ URL the behaviour is unchanged.
 
 The envelope is unchanged (`schema_version` stays `1`); SQS is purely additive.
 
@@ -147,7 +155,7 @@ publish is byte-identical to `PublishAsync`. Requires `BabelQueue.Core 1.4.0`.
 dotnet test
 ```
 
-`IAmazonSQS` is an interface, so the unit tests mock it with Moq — no AWS, no network.
+`IAmazonSQS` is an interface, so the unit tests mock it with Moq — no AWS, no network. The vendored conformance suite (v1.8.0: `poison_dlq`, `version_gate_sqs`) is run too.
 
 ## License
 
