@@ -943,4 +943,220 @@ public sealed class SqsConsumerTests
         Assert.Throws<ArgumentException>(
             () => new SqsConsumer(new Mock<IAmazonSQS>().Object, Url, new Dictionary<string, BabelHandler>(), options));
     }
+
+    // ---- ADR-0039 section 5.1: dead-letter observer ----
+
+    private sealed class RecordingObserver : IDeadLetterObserver
+    {
+        public List<DeadLetterEvent> Events { get; } = new();
+
+        public bool Throw { get; init; }
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent)
+        {
+            Events.Add(deadLetterEvent);
+            if (Throw)
+            {
+                throw new InvalidOperationException("observer failure");
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAVersionGatedRawBodyWithAnEmptyReason()
+    {
+        var observer = new RecordingObserver();
+        var (mock, _) = MockWithDlq(WithSchemaVersion(Envelope(), "2"));
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, DeadLetterObserver = observer };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", string.Empty), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAPoisonBodyWithTheCanonicalReason()
+    {
+        var observer = new RecordingObserver();
+        var (mock, _) = MockWithDlq(Seed("{\"not\":\"an envelope\"}", 1));
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, DeadLetterObserver = observer };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAnUnknownUrnDeadLetterWithTheEnvelopeQueue()
+    {
+        var observer = new RecordingObserver();
+        var (mock, _) = MockWithDlq(Seed(Envelope(), 1));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Dlq,
+            DeadLetterObserver = observer,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    private static string EnvelopeFor(string queue)
+        => Envelope().Replace("\"queue\":\"orders\"", "\"queue\":\"" + queue + "\"", StringComparison.Ordinal);
+
+    [Fact]
+    public async Task UnknownUrnEventCarriesTheEnvelopeQueueNotTheConsumerQueue()
+    {
+        var body = EnvelopeFor("billing");
+        Assert.Contains("\"queue\":\"billing\"", body, StringComparison.Ordinal);
+        var observer = new RecordingObserver();
+        var (mock, _) = MockWithDlq(Seed(body, 1));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Dlq,
+            DeadLetterObserver = observer,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("billing", "orders.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\\t\\n")]
+    public async Task UnknownUrnEventFallsBackToTheConsumerQueueWhenMetaQueueIsBlank(string blank)
+    {
+        var body = EnvelopeFor(blank);
+        var observer = new RecordingObserver();
+        var (mock, _) = MockWithDlq(Seed(body, 1));
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Dlq,
+            DeadLetterObserver = observer,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal("orders", Assert.Single(observer.Events).Queue);
+    }
+
+    [Fact]
+    public async Task PoisonAndGatedEventsCarryTheConsumerQueueEvenWhenTheBodyNamesAnother()
+    {
+        var observer = new RecordingObserver();
+        var options = new SqsConsumerOptions { DeadLetterQueueUrl = Dlq, DeadLetterObserver = observer };
+
+        // Poison: carries meta.queue "billing" but has no job/urn identity.
+        var (poison, _) = MockWithDlq(Seed("{\"meta\":{\"queue\":\"billing\"}}", 1));
+        await new SqsConsumer(poison.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        // Version-gated: a valid envelope for "billing" behind an unsupported bq-schema-version attribute.
+        var (gated, _) = MockWithDlq(WithSchemaVersion(EnvelopeFor("billing"), "2"));
+        await new SqsConsumer(gated.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Equal(
+            new[] { new DeadLetterEvent("orders", "orders.dlq", "poison"), new DeadLetterEvent("orders", "orders.dlq", string.Empty) },
+            observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheDlqWriteFails()
+    {
+        foreach (var message in new[] { WithSchemaVersion(Envelope(), "2"), Seed("{\"not\":\"an envelope\"}", 1), Seed(Envelope(), 1) })
+        {
+            var observer = new RecordingObserver();
+            var (mock, _) = MockWithDlq(message, new AmazonSQSException("dlq down"));
+            var options = new SqsConsumerOptions
+            {
+                UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+                DeadLetterQueueUrl = Dlq,
+                DeadLetterObserver = observer,
+                OnError = (_, _, _) => { },
+            };
+
+            await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+            Assert.Empty(observer.Events);
+            mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenNothingIsWrittenToTheDlq()
+    {
+        var observer = new RecordingObserver();
+
+        // No DLQ URL: poison and gated are left to the native RedrivePolicy; the dead_letter strategy degrades to delete.
+        foreach (var message in new[] { WithSchemaVersion(Envelope(), "2"), Seed("{\"not\":\"an envelope\"}", 1), Seed(Envelope(), 1) })
+        {
+            var (mock, sent) = MockWithDlq(message);
+            var options = new SqsConsumerOptions { UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter, DeadLetterObserver = observer };
+            await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+            Assert.Empty(sent);
+        }
+
+        // Delete strategy with a DLQ configured: dropped, not dead-lettered.
+        foreach (var message in new[] { WithSchemaVersion(Envelope(), "2"), Seed("{\"not\":\"an envelope\"}", 1) })
+        {
+            var (mock, sent) = MockWithDlq(message);
+            var options = new SqsConsumerOptions
+            {
+                UnknownUrnStrategy = UnknownUrnStrategy.Delete,
+                DeadLetterQueueUrl = Dlq,
+                DeadLetterObserver = observer,
+            };
+            await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+            Assert.Empty(sent);
+        }
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ThrowingObserverDoesNotChangeTheSettleOutcome()
+    {
+        var observer = new RecordingObserver { Throw = true };
+        var (mock, sent) = MockWithDlq(Seed("{\"not\":\"an envelope\"}", 1));
+        var reported = new List<Exception>();
+        var options = new SqsConsumerOptions
+        {
+            DeadLetterQueueUrl = Dlq,
+            DeadLetterObserver = observer,
+            OnError = (e, _, _) => reported.Add(e),
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Single(observer.Events);
+        Assert.Single(sent);
+        mock.Verify(c => c.DeleteMessageAsync(It.Is<DeleteMessageRequest>(r => r.ReceiptHandle == "rh-1"), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.IsType<BabelQueueException>(Assert.Single(reported));
+    }
+
+    [Fact]
+    public async Task ThrowingObserverOnAnUnknownUrnDeadLetterStillDeletesTheMessage()
+    {
+        var observer = new RecordingObserver { Throw = true };
+        var (mock, sent) = MockWithDlq(Seed(Envelope(), 1));
+        var errors = 0;
+        var options = new SqsConsumerOptions
+        {
+            UnknownUrnStrategy = UnknownUrnStrategy.DeadLetter,
+            DeadLetterQueueUrl = Dlq,
+            DeadLetterObserver = observer,
+            OnError = (_, _, _) => errors++,
+        };
+
+        await new SqsConsumer(mock.Object, Url, new Dictionary<string, BabelHandler>(), options).PollAsync();
+
+        Assert.Single(sent);
+        Assert.Equal(0, errors);
+        mock.Verify(c => c.DeleteMessageAsync(It.IsAny<DeleteMessageRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
 }

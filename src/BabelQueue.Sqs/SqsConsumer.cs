@@ -139,7 +139,7 @@ public sealed class SqsConsumer
                 $"Rejected an SQS message: unsupported {SchemaVersionAttribute} attribute '{declaredVersion}' "
                 + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded.");
             var empty = new Envelope(null, null, null, null, 0, null);
-            await SettleTerminalAsync(message, () => message.Body ?? string.Empty, empty, rejected, cancellationToken)
+            await SettleTerminalAsync(message, () => message.Body ?? string.Empty, string.Empty, empty, rejected, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -161,6 +161,7 @@ public sealed class SqsConsumer
                     DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     SqsPublisher.QueueName(_queueUrl),
                     envelope.Attempts)),
+                "poison",
                 envelope,
                 cause,
                 cancellationToken).ConfigureAwait(false);
@@ -215,10 +216,16 @@ public sealed class SqsConsumer
     /// message deleted only after the write succeeded (a failed write leaves it undeleted: unsettled, reported); with no
     /// DLQ it is handed to the native mechanism -- not deleted, not released -- so visibility expiry redelivers it and the
     /// queue's <c>RedrivePolicy</c> applies. The rejection is reported after the settle.
+    /// <para>
+    /// After the DLQ write is confirmed the optional <see cref="SqsConsumerOptions.DeadLetterObserver"/> is told with
+    /// <paramref name="reason"/> (empty for a raw version-gated body, <c>poison</c> for a poison record). The native hand-off
+    /// and a drop are not SDK dead-letters and are not reported (ADR-0039 section 5.1).
+    /// </para>
     /// </summary>
     private async Task SettleTerminalAsync(
         Message message,
         Func<string> record,
+        string reason,
         Envelope envelope,
         BabelQueueException rejected,
         CancellationToken cancellationToken)
@@ -233,7 +240,7 @@ public sealed class SqsConsumer
             await GuardAsync(
                 async () =>
                 {
-                    await WriteDeadLetterRecordAsync(message, record(), cancellationToken).ConfigureAwait(false);
+                    await WriteDeadLetterRecordAsync(message, record(), reason, cancellationToken).ConfigureAwait(false);
                     await DeleteAsync(message, cancellationToken).ConfigureAwait(false);
                 },
                 envelope,
@@ -251,8 +258,12 @@ public sealed class SqsConsumer
         _options.OnError?.Invoke(rejected, envelope, message);
     }
 
-    /// <summary>Writes <paramref name="body"/> as the body of a new message on the DLQ (FIFO: group = queue name, dedupe = SQS message id).</summary>
-    private async Task WriteDeadLetterRecordAsync(Message message, string body, CancellationToken cancellationToken)
+    /// <summary>
+    /// Writes <paramref name="body"/> as the body of a new message on the DLQ (FIFO: group = queue name, dedupe = SQS message id),
+    /// then reports it to the dead-letter observer. A failed send throws before the observer is called. If the delete that
+    /// follows fails the message is redelivered and written again, so the observer is called again (at-least-once).
+    /// </summary>
+    private async Task WriteDeadLetterRecordAsync(Message message, string body, string reason, CancellationToken cancellationToken)
     {
         var request = new SendMessageRequest { QueueUrl = _options.DeadLetterQueueUrl, MessageBody = body };
         if (_options.DeadLetterQueueUrl!.EndsWith(".fifo", StringComparison.Ordinal))
@@ -262,6 +273,11 @@ public sealed class SqsConsumer
         }
 
         await _client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+        if (_options.DeadLetterObserver is { } observer)
+        {
+            observer.NotifySafely(new DeadLetterEvent(
+                SqsPublisher.QueueName(_queueUrl), SqsPublisher.QueueName(_options.DeadLetterQueueUrl), reason));
+        }
     }
 
     private static readonly JsonWriterOptions PoisonWriterOptions = new()
@@ -404,6 +420,35 @@ public sealed class SqsConsumer
         }
 
         await _client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+        if (_options.DeadLetterObserver is { } observer)
+        {
+            observer.NotifySafely(new DeadLetterEvent(
+                IsBlankQueue(envelope.Meta?.Queue) ? SqsPublisher.QueueName(_queueUrl) : envelope.Meta!.Queue!,
+                SqsPublisher.QueueName(_options.DeadLetterQueueUrl),
+                "unknown_urn"));
+        }
+    }
+
+    /// <summary>
+    /// Blank in the shared cross-SDK sense (ADR-0031): empty or only ASCII whitespace (space, <c>\t</c>, <c>\n</c>, U+000B,
+    /// <c>\f</c>, <c>\r</c>) -- not <see cref="string.IsNullOrWhiteSpace"/>, which also counts Unicode spaces.
+    /// </summary>
+    private static bool IsBlankQueue(string? value)
+    {
+        if (value is null)
+        {
+            return true;
+        }
+
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

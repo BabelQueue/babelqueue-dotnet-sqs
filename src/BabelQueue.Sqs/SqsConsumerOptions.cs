@@ -102,4 +102,19 @@ public sealed class SqsConsumerOptions
     /// <c>MessageDeduplicationId</c> = the SQS message id (not <c>meta.queue</c> / <c>meta.id</c>: there is no usable envelope).
     /// </summary>
     public string? DeadLetterQueueUrl { get; set; }
+
+    /// <summary>
+    /// Optional hook called for each dead-letter record this consumer <b>wrote</b> to <see cref="DeadLetterQueueUrl"/>,
+    /// after the send is confirmed (ADR-0039 section 5.1), <b>at-least-once</b>: if the <c>DeleteMessage</c> that follows
+    /// fails, the message is redelivered and written again, so the observer is called again. A FIFO DLQ deduplicates the
+    /// record (same <c>MessageDeduplicationId</c>) but not the call, so the count can exceed the records in the DLQ.
+    /// Reported cases: an unknown URN under the <c>dead_letter</c> strategy
+    /// (<c>reason</c> <c>unknown_urn</c>), a poison body (<c>poison</c>) and a raw schema-version-gated body (empty
+    /// <c>reason</c>). It is not called when the send fails, when the message is dropped (<c>delete</c>) or left to the
+    /// queue's native <c>RedrivePolicy</c> (also what exhausted retries use), or when no DLQ URL is configured.
+    /// An exception it throws is caught and logged by <see cref="DeadLetterObservers.NotifySafely"/> and never changes
+    /// the settle outcome. <c>null</c> (the default) changes nothing; <see cref="Tracing.MetricsDeadLetterObserver"/>
+    /// counts <c>babelqueue.dlq.messages</c>.
+    /// </summary>
+    public IDeadLetterObserver? DeadLetterObserver { get; set; }
 }
