@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** New `SqsConsumerOptions.DeadLetterObserver` (`BabelQueue.IDeadLetterObserver`
@@ -21,6 +23,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   (`delete`), when no DLQ URL is set, or for exhausted retries, which stay with the queue's native `RedrivePolicy`. An exception
   the observer throws is caught and logged and never changes the settle outcome. `null` (the default) changes nothing.
   Needs a `BabelQueue.Core` release that ships `IDeadLetterObserver`; no wire change (`schema_version: 1`).
+
+### Changed
+
+- `BabelQueue.Core` dependency raised from `1.13.0` to `1.14.0` (`IDeadLetterObserver`).
 
 ## [1.4.0] - 2026-10-26
 
