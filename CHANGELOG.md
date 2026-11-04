@@ -9,6 +9,25 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-03
+
+### Added
+
+- **Dead-letter observer (ADR-0039 section 5.1).** New `SqsConsumerOptions.DeadLetterObserver` (`BabelQueue.IDeadLetterObserver`
+  from `BabelQueue.Core`, e.g. `MetricsDeadLetterObserver`, which counts `babelqueue.dlq.messages`). It is called for each
+  record the consumer **wrote** to `DeadLetterQueueUrl`, after the send is confirmed, at-least-once (if the `DeleteMessage` that
+  follows fails the message is redelivered and written again, so the observer is called again; a FIFO DLQ deduplicates the
+  record but not the call): an unknown URN under the `dead_letter`
+  strategy (`reason` `unknown_urn`, `Queue` = `meta.queue`), a poison body (`poison`) and a raw schema-version-gated body
+  (empty `reason`). `DeadLetterQueue` is the DLQ's name. It is not called when the send fails, when the message is dropped
+  (`delete`), when no DLQ URL is set, or for exhausted retries, which stay with the queue's native `RedrivePolicy`. An exception
+  the observer throws is caught and logged and never changes the settle outcome. `null` (the default) changes nothing.
+  Needs a `BabelQueue.Core` release that ships `IDeadLetterObserver`; no wire change (`schema_version: 1`).
+
+### Changed
+
+- `BabelQueue.Core` dependency raised from `1.13.0` to `1.14.0` (`IDeadLetterObserver`).
+
 ## [1.4.0] - 2026-10-26
 
 Implements ADR-0037 decisions 1 and 2. The envelope stays at `schema_version: 1`; every change is a consumer-side settle
