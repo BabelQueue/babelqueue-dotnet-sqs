@@ -147,7 +147,7 @@ On the consume side, surface the inbound attributes and start the consumer span 
 
 `SqsHeaders.Merge` never clobbers the contract `bq-*` attributes and respects the SQS 10-attribute
 cap; with no `traceparent` the consumer falls back to the v0.1 `trace_id` mapping. A header-less
-publish is byte-identical to `PublishAsync`. Requires `BabelQueue.Core 1.4.0`.
+publish is byte-identical to `PublishAsync`. Requires `BabelQueue.Core 1.14.0`.
 
 ## Build & test
 
