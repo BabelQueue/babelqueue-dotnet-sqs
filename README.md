@@ -133,9 +133,14 @@ the header-aware overload; the carrier is filled by `BabelQueue.Core`'s `Telemet
 using BabelQueue.Tracing;
 
 var headers = new Dictionary<string, string>();
+var publisher = new SqsPublisher(sqs, url);
 await Telemetry.PublishAsync("urn:babel:orders:created", data, headers,
-    env => new SqsPublisher(sqs, url).PublishWithHeadersAsync("urn:babel:orders:created", data, headers));
+    env => publisher.PublishEnvelopeAsync(env, headers), "orders", Telemetry.Systems.AwsSqs);
 ```
+
+`PublishEnvelopeAsync` sends the envelope `Telemetry.PublishAsync` built **as is** (no rebuild), so the producer
+span's `messaging.message.id` is the `meta.id` on the wire. Pass the queue name as `Telemetry`'s `queue` argument:
+it becomes `meta.queue`, which `PublishEnvelopeAsync` does not override.
 
 On the consume side, surface the inbound attributes and start the consumer span as a child:
 
